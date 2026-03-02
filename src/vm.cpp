@@ -28,7 +28,7 @@
 #endif
 
 //#if defined(LINUX) && defined(CPU_x86_64)
-#if defined(CPU_x86_64) && !defined(__APPLE__) && !defined(_WIN32)
+#if defined(CPU_x86_64) && !defined(__APPLE__) && !defined(_WIN32) && !defined(__FreeBSD__)
 #define HAVE_MAP_32BIT 1
 #endif
 
@@ -197,7 +197,14 @@ static void *uae_vm_alloc_with_flags(uae_u32 size, int flags, int protect)
 #ifdef _WIN32
 			address = VirtualAlloc(p, size, va_type, va_protect);
 #else
+#if defined(__FreeBSD__)
+			/* FreeBSD ignores hint addresses; use MAP_FIXED|MAP_EXCL to force
+			 * exact placement or get a clean failure for this loop iteration. */
+			address = mmap(p, size, mmap_prot,
+			               mmap_flags | MAP_FIXED | MAP_EXCL, -1, 0);
+#else
 			address = mmap(p, size, mmap_prot, mmap_flags, -1, 0);
+#endif
 			// write_log("VM: trying %p step is 0x%x = %p\n", p, step, address);
 			if (address == MAP_FAILED) {
 				address = NULL;
@@ -349,14 +356,23 @@ static void *try_reserve(uintptr_t try_addr, uae_u32 size, int flags)
 #endif
 	}
 #endif
-    #if defined(__FreeBSD__)
-    // On FreeBSD, force the main memory reservation into the low 32-bit space.
-    // This is critical for the JIT's direct memory access model.
-    // We use a fixed hint and explicitly add MAP_32BIT.
-    try_addr = 0x10000000;
-    mmap_flags |= MAP_32BIT;
-    #endif
+#if defined(__FreeBSD__)
+	/* FreeBSD ignores mmap address hints for large allocations, always
+	 * returning memory at ~33GB (kern.maxdsiz default). The x86-64 JIT
+	 * requires natmem_offset < 4GB. Use MAP_FIXED|MAP_EXCL when a hint
+	 * address is given: this forces exact placement or fails cleanly
+	 * (ENOMEM) so the walk-down loop in uae_vm_reserve() can try the
+	 * next lower address. MAP_EXCL prevents clobbering existing mappings.
+	 * When try_addr==0 (unconstrained fallback) use normal mmap. */
+	if (try_addr != 0) {
+		address = mmap((void *) try_addr, size, PROT_NONE,
+		               mmap_flags | MAP_FIXED | MAP_EXCL, -1, 0);
+	} else {
+		address = mmap(0, size, PROT_NONE, mmap_flags, -1, 0);
+	}
+#else
 	address = mmap((void *) try_addr, size, PROT_NONE, mmap_flags, -1, 0);
+#endif
 	if (address == MAP_FAILED) {
 		return NULL;
 	}
