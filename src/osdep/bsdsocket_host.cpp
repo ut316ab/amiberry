@@ -3942,7 +3942,7 @@ uae_u32 bsdthr_Recv_2 (SB)
             }
             n = recv(sb->s, (char*)sb->buf, sb->len, sb->flags /*| MSG_NOSIGNAL*/);
             foo = (int)n;
-            write_log("recv2, recv returns %d, errno is %d\n", foo, errno);
+            { int _e = errno; write_log("recv2, recv returns %d, errno is %d\n", foo, _e); errno = _e; }
             if (foo >= 0) break;
         } while (errno == EINTR && --retries > 0);
     } else {
@@ -4008,7 +4008,7 @@ uae_u32 bsdthr_Connect_2 (SB)
 		int retval;
 		copysockaddr_a2n (&addr, sb->a_addr, sb->a_addrlen);
 		retval = connect (sb->s, (struct sockaddr *)&addr, len);
-		write_log ("Connect returns %d, errno is %d\n", retval, errno);
+		{ int _e = errno; write_log ("Connect returns %d, errno is %d\n", retval, _e); errno = _e; }
 		/* Hack: I need to set the action to something other than
 		 * 1 but I know action == 2 does the correct thing
 		 */
@@ -4083,8 +4083,10 @@ uae_u32 bsdthr_blockingstuff(uae_u32(*tryfunc)(SB), SB)
         do {
             foo = tryfunc(sb);
         } while (foo < 0 && errno == EINTR); // retry on EINTR
+        int saved_errno = errno;
         if (foo < 0 && !nonblock) {
-            if ((errno == EAGAIN) || (errno == EWOULDBLOCK) || (errno == EINPROGRESS)) {
+            errno = saved_errno;
+            if ((saved_errno == EAGAIN) || (saved_errno == EWOULDBLOCK) || (saved_errno == EINPROGRESS)) {
                 fd_set readset, writeset, exceptset;
                 int maxfd = (sb->s > sb->sockabort[0]) ? sb->s : sb->sockabort[0];
                 int num;
@@ -4362,6 +4364,13 @@ void host_sbcleanup (SB)
 	unregister_all_socket_events(sb);
 
 	uae_thread_id thread = sb->thread;
+	/* Abort any pending blocking operation BEFORE closing the pipe.
+	 * Without this, a connect() blocked in select() inside bsdthr_blockingstuff
+	 * will never see the wakeup and the thread hangs forever. */
+	sb->action = 0;
+	sockabort(sb);           /* unblocks any select() waiting on sockabort[0] */
+	uae_sem_post(&sb->sem);  /* wakes thread if blocked on semaphore instead */
+
 	close_pipe (sb->sockabort[0]);
 	close_pipe (sb->sockabort[1]);
 	for (i = 0; i < sb->dtablesize; i++) {
@@ -4369,9 +4378,6 @@ void host_sbcleanup (SB)
 			close_socket(sb->dtable[i]);
 		}
 	}
-	sb->action = 0;
-
-	uae_sem_post (&sb->sem); /* destroy happens on socket thread */
 
 	/* We need to join with the socket thread to allow the thread to die
 	 * and clean up resources when the underlying thread layer is pthreads.
